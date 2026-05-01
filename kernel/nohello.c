@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
-//
-// nohello - hide /data/nohello from all system calls
-//
-// Uses kprobes to intercept VFS operations and make the target file
-// appear as non-existent. Identification uses (inode, dev) as the
-// system-unique pair.
-//
-// Target: GKI kernels (android12-5.10 through android16-6.12)
+/*
+ * nohello - hide a given file from all system calls (arm64 Android / GKI)
+ *
+ * Uses kretprobes to intercept VFS operations and make the target file
+ * appear as non-existent.  Identification is via the (inode, dev) pair.
+ *
+ * Tested on GKI kernels (android12-5.10 through android16-6.12).
+ * Only the arm64 architecture is supported.
+ */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -18,11 +19,23 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#define TARGET_PATH "/data/nohello"
+/* ---------- module parameter ---------- */
+static char *target_path = "/data/nohello";
+module_param(target_path, charp, 0644);
+MODULE_PARM_DESC(target_path, "Absolute path to hide");
+
+/* system-unique target identifiers */
 static dev_t target_dev;
 static unsigned long long target_ino;
 
-/* -- security_inode_permission -- open, access, chmod, chown, ... --------- */
+/* ---------- helper ---------- */
+static inline bool is_target_inode(const struct inode *inode)
+{
+	return inode && inode->i_ino == target_ino &&
+	       inode->i_sb->s_dev == target_dev;
+}
+
+/* ---------- security_inode_permission ---------- */
 static struct kretprobe kp_inode_perm;
 
 struct inode_perm_data {
@@ -32,19 +45,9 @@ struct inode_perm_data {
 static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
-	struct inode *inode;
+	struct inode *inode = (struct inode *)regs->regs[0]; /* x0 */
 
-	d->matched = 0;
-
-#if defined(__aarch64__)
-	inode = (struct inode *)regs->regs[0];
-#elif defined(__x86_64__)
-	inode = (struct inode *)regs->regs[0]; /* rdi */
-#endif
-
-	if (inode->i_ino == target_ino && inode->i_sb->s_dev == target_dev)
-		d->matched = 1;
-
+	d->matched = is_target_inode(inode);
 	return 0;
 }
 
@@ -54,32 +57,19 @@ static int perm_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	if (d->matched)
 		regs_set_return_value(regs, -ENOENT);
-
 	return 0;
 }
 
-/* -- security_inode_getattr -- stat, statx, lstat ------------------------ */
+/* ---------- security_inode_getattr ---------- */
 static struct kretprobe kp_inode_getattr;
 
 static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
-	struct path *path;
-	struct inode *inode;
+	struct path *path = (struct path *)regs->regs[0]; /* x0 */
+	struct inode *inode = d_inode(path->dentry);
 
-	d->matched = 0;
-
-#if defined(__aarch64__)
-	path = (struct path *)regs->regs[0];	/* x0 */
-#elif defined(__x86_64__)
-	path = (struct path *)regs->regs[0];	/* rdi */
-#endif
-
-	inode = d_inode(path->dentry);
-	if (inode && inode->i_ino == target_ino &&
-	    inode->i_sb->s_dev == target_dev)
-		d->matched = 1;
-
+	d->matched = is_target_inode(inode);
 	return 0;
 }
 
@@ -89,23 +79,10 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	if (d->matched)
 		regs_set_return_value(regs, -ENOENT);
-
 	return 0;
 }
 
-/* -- __arm64_sys_getdents64 -- getdents / directory listing -------------- */
-/*
- * On arm64 the getdents64 syscall handler is __arm64_sys_getdents64.
- * It takes a single const struct pt_regs * argument (the syscall registers).
- *
- * regs->regs[0] = fd    (from userspace x0)
- * regs->regs[1] = dirent (from userspace x1, the user buffer)
- * regs->regs[2] = count  (from userspace x2)
- *
- * Using a kretprobe on __arm64_sys_getdents64 (arm64-specific symbol) is
- * reliable because it is always the syscall entry point and always in
- * kallsyms on arm64 GKI kernels.
- */
+/* ---------- __arm64_sys_getdents64 ---------- */
 static struct kretprobe kp_getdents;
 
 struct getdents_cb_data {
@@ -114,39 +91,25 @@ struct getdents_cb_data {
 };
 
 /*
- * Entry: called in process context (GFP_KERNEL safe).
- * Extract the user buffer pointer from the nested pt_regs.
- * __arm64_sys_getdents64(const struct pt_regs *syscall_regs):
- *   x0 = struct pt_regs *  -->  regs->regs[0] is the syscall registers pointer
- *   user_regs->regs[1]     = the "dirent" buffer argument from userspace
+ * Entry: __arm64_sys_getdents64(const struct pt_regs *syscall_regs)
+ *   syscall_regs->regs[1] = user buffer (dirent)
+ *   syscall_regs->regs[2] = count
  */
 static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
-	unsigned int count;
+	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	unsigned int count = (unsigned int)user_regs->regs[2];
 
-#if defined(__aarch64__)
-	{
-		struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
-		d->dirent = (struct linux_dirent64 __user *)user_regs->regs[1];
-		count = (unsigned int)user_regs->regs[2];
-	}
-#else
-	/* On x86_64, __x64_sys_getdents64 takes fd, dirent, count directly */
-	d->dirent = (struct linux_dirent64 __user *)regs->regs[1]; /* rsi */
-	count = (unsigned int)regs->regs[2]; /* rdx */
-#endif
+	d->dirent = (struct linux_dirent64 __user *)user_regs->regs[1];
 
-	d->kbuf = kzalloc(count, GFP_KERNEL);
+	/* Guard against excessively large allocations */
+	count = min(count, 65536u);
 
+	d->kbuf = kmalloc(count, GFP_KERNEL);
 	return 0;
 }
 
-/*
- * Exit: called after the syscall returns.  The user buffer is already
- * filled with linux_dirent64 entries.  Walk the buffer, remove the
- * entry whose d_ino matches target_ino, and adjust the return value.
- */
 static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
@@ -154,6 +117,7 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct linux_dirent64 *kbuf, *src, *dst;
 	long remain, new_len;
 	const size_t hdr_off = offsetof(struct linux_dirent64, d_name);
+	const size_t min_reclen = offsetof(struct linux_dirent64, d_name) + 1;
 
 	if (ret <= 0 || !d->dirent || !d->kbuf)
 		goto out;
@@ -166,7 +130,8 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	dst = kbuf;
 	remain = ret;
 
-	while (remain > (long)hdr_off && src->d_reclen > 0 &&
+	while (remain > (long)hdr_off &&
+	       src->d_reclen >= min_reclen &&
 	       remain >= (long)src->d_reclen) {
 
 		if (src->d_ino == (__u64)target_ino) {
@@ -189,9 +154,12 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	new_len = (long)((char *)dst - (char *)kbuf);
 
-	if (new_len < ret &&
-	    !copy_to_user(d->dirent, kbuf, new_len)) {
-		regs->regs[0] = new_len;
+	if (new_len < ret) {
+		if (copy_to_user(d->dirent, kbuf, new_len))
+			pr_warn_ratelimited("nohello: copy_to_user failed, "
+					    "directory may leak\n");
+		else
+			regs->regs[0] = new_len;
 	}
 
 out:
@@ -200,15 +168,15 @@ out:
 	return 0;
 }
 
-/* -- Module init / exit -------------------------------------------------- */
+/* ---------- module init / exit ---------- */
 static int __init nohello_init(void)
 {
 	struct path path;
 	int ret;
 
-	ret = kern_path(TARGET_PATH, 0, &path);
+	ret = kern_path(target_path, 0, &path);
 	if (ret) {
-		pr_err("nohello: %s not found (err=%d)\n", TARGET_PATH, ret);
+		pr_err("nohello: %s not found (err=%d)\n", target_path, ret);
 		return -ENOENT;
 	}
 
@@ -218,7 +186,7 @@ static int __init nohello_init(void)
 		target_ino, MAJOR(target_dev), MINOR(target_dev));
 	path_put(&path);
 
-	/* -- kretprobe: security_inode_permission -- */
+	/* security_inode_permission */
 	kp_inode_perm.kp.symbol_name = "security_inode_permission";
 	kp_inode_perm.entry_handler = perm_inode_entry;
 	kp_inode_perm.handler = perm_exit;
@@ -232,7 +200,7 @@ static int __init nohello_init(void)
 	}
 	pr_info("nohello: hooked security_inode_permission\n");
 
-	/* -- kretprobe: security_inode_getattr -- */
+	/* security_inode_getattr */
 	kp_inode_getattr.kp.symbol_name = "security_inode_getattr";
 	kp_inode_getattr.entry_handler = getattr_entry;
 	kp_inode_getattr.handler = getattr_exit;
@@ -247,7 +215,7 @@ static int __init nohello_init(void)
 	}
 	pr_info("nohello: hooked security_inode_getattr\n");
 
-	/* -- kretprobe: __arm64_sys_getdents64 -- */
+	/* __arm64_sys_getdents64 */
 	kp_getdents.kp.symbol_name = "__arm64_sys_getdents64";
 	kp_getdents.entry_handler = getdents_entry;
 	kp_getdents.handler = getdents_exit;
@@ -262,7 +230,7 @@ static int __init nohello_init(void)
 		pr_info("nohello: hooked __arm64_sys_getdents64\n");
 	}
 
-	pr_info("nohello: loaded -- %s is now hidden\n", TARGET_PATH);
+	pr_info("nohello: loaded -- %s is now hidden\n", target_path);
 	return 0;
 }
 
@@ -270,11 +238,9 @@ static void __exit nohello_exit(void)
 {
 	unregister_kretprobe(&kp_inode_perm);
 	unregister_kretprobe(&kp_inode_getattr);
-	synchronize_rcu();
-
 	unregister_kretprobe(&kp_getdents);
 
-	pr_info("nohello: unloaded -- %s is visible again\n", TARGET_PATH);
+	pr_info("nohello: unloaded -- %s is visible again\n", target_path);
 }
 
 module_init(nohello_init);
@@ -282,7 +248,7 @@ module_exit(nohello_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lkm-build");
-MODULE_DESCRIPTION("Hide /data/nohello by intercepting VFS operations via kprobes");
+MODULE_DESCRIPTION("Hide a file by intercepting VFS operations via kprobes");
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 #else

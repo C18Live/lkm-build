@@ -14,15 +14,12 @@
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/version.h>
-#include <linux/dirent.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
 
 #define TARGET_PATH "/data/nohello"
 static dev_t target_dev;
 static unsigned long long target_ino;
 
-/* ── security_inode_permission — open, access, chmod, chown, … ──────────── */
+/* -- security_inode_permission -- open, access, chmod, chown, ... --------- */
 static struct kretprobe kp_inode_perm;
 
 struct inode_perm_data {
@@ -62,7 +59,7 @@ static int perm_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-/* ── security_inode_getattr — stat, statx, lstat ────────────────────────── */
+/* -- security_inode_getattr -- stat, statx, lstat ------------------------ */
 static struct kretprobe kp_inode_getattr;
 
 static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -97,92 +94,43 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-/* ── ksys_getdents64 — getdents / directory listing ─────────────────────── */
+/* -- filldir64 -- getdents / directory listing -------------------------- */
 /*
- * ksys_getdents64(unsigned int fd, struct linux_dirent64 __user *dirent,
- *                  unsigned int count)
+ * filldir64(struct dir_context *ctx, const char *name, int namelen,
+ *           loff_t offset, u64 ino, unsigned int d_type)
  *
- * We allocate a temp buffer in the entry handler (process context, GFP_KERNEL)
- * and post-process it in the exit handler to remove the matching entry.
+ * Instead of skipping the function (which stalls filesystem iterators),
+ * we zero out the ino register. filldir64 writes d_ino=0 to the user
+ * buffer; userspace tools (ls, find, etc.) skip entries with d_ino=0.
  *
- * arm64: x0=fd, x1=dirent, x2=count
- * x86_64: rdi=fd, rsi=dirent, rdx=count
+ * arm64: x0=ctx, x1=name, x2=namelen, x3=offset, x4=ino, x5=d_type
+ * x86_64: rdi, rsi, rdx, rcx, r8, r9
  */
-static struct kretprobe kp_getdents;
+static struct kprobe kp_filldir;
 
-struct getdents_cb_data {
-	struct linux_dirent64 __user *dirent;
-	void *kbuf;
-};
-
-static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int filldir_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
-	unsigned int count;
+	u64 ino;
 
 #if defined(__aarch64__)
-	d->dirent = (struct linux_dirent64 __user *)regs->regs[1];
-	count = (unsigned int)regs->regs[2];
+	ino = regs->regs[4];
 #elif defined(__x86_64__)
-	d->dirent = (struct linux_dirent64 __user *)regs->regs[1];
-	count = (unsigned int)regs->regs[2];
+	ino = regs->r8;
+#else
+	return 0;
 #endif
 
-	/* entry handler is process context, safe for GFP_KERNEL */
-	d->kbuf = kzalloc(count, GFP_KERNEL);
-
-	return 0;
-}
-
-static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
-	long ret = regs->regs[0];
-	struct linux_dirent64 *src, *dst;
-	long remain, new_len;
-	const size_t hdr_off = offsetof(struct linux_dirent64, d_name);
-
-	if (ret <= 0 || !d->dirent || !d->kbuf)
-		goto out;
-
-	if (copy_from_user(d->kbuf, d->dirent, ret))
-		goto out;
-
-	src = d->kbuf;
-	dst = d->kbuf;
-	remain = ret;
-
-	while (remain > (long)hdr_off && src->d_reclen > 0 &&
-	       remain >= (long)src->d_reclen) {
-
-		if (src->d_ino == (__u64)target_ino) {
-			long skip = src->d_reclen;
-			long tail = remain - skip;
-			if (tail > 0)
-				memmove(dst, (char *)src + skip, tail);
-			remain -= skip;
-			src = (struct linux_dirent64 *)((char *)src + skip);
-			continue;
-		}
-
-		if (dst != src)
-			memmove(dst, src, src->d_reclen);
-		dst = (struct linux_dirent64 *)((char *)dst + src->d_reclen);
-		remain -= src->d_reclen;
-		src = (struct linux_dirent64 *)((char *)src + src->d_reclen);
+	if (ino == (u64)target_ino) {
+#if defined(__aarch64__)
+		regs->regs[4] = 0;	/* zero ino -> userspace skips entry */
+#elif defined(__x86_64__)
+		regs->r8 = 0;
+#endif
 	}
-
-	new_len = (long)((char *)dst - (char *)d->kbuf);
-	if (new_len < ret && !copy_to_user(d->dirent, d->kbuf, new_len))
-		regs->regs[0] = new_len;
-
-out:
-	kfree(d->kbuf);
-	d->kbuf = NULL;
-	return 0;
+	return 0;	/* let filldir64 execute with modified ino */
 }
 
-/* ── Module init / exit ─────────────────────────────────────────────────── */
+/* -- Module init / exit -------------------------------------------------- */
 static int __init nohello_init(void)
 {
 	struct path path;
@@ -200,7 +148,7 @@ static int __init nohello_init(void)
 		target_ino, MAJOR(target_dev), MINOR(target_dev));
 	path_put(&path);
 
-	/* ── kretprobe: security_inode_permission ── */
+	/* -- kretprobe: security_inode_permission -- */
 	kp_inode_perm.kp.symbol_name = "security_inode_permission";
 	kp_inode_perm.entry_handler = perm_inode_entry;
 	kp_inode_perm.handler = perm_exit;
@@ -214,7 +162,7 @@ static int __init nohello_init(void)
 	}
 	pr_info("nohello: hooked security_inode_permission\n");
 
-	/* ── kretprobe: security_inode_getattr ── */
+	/* -- kretprobe: security_inode_getattr -- */
 	kp_inode_getattr.kp.symbol_name = "security_inode_getattr";
 	kp_inode_getattr.entry_handler = getattr_entry;
 	kp_inode_getattr.handler = getattr_exit;
@@ -229,22 +177,19 @@ static int __init nohello_init(void)
 	}
 	pr_info("nohello: hooked security_inode_getattr\n");
 
-	/* ── kretprobe: ksys_getdents64 (directory listing) ── */
-	kp_getdents.kp.symbol_name = "ksys_getdents64";
-	kp_getdents.entry_handler = getdents_entry;
-	kp_getdents.handler = getdents_exit;
-	kp_getdents.data_size = sizeof(struct getdents_cb_data);
-	kp_getdents.maxactive = 20;
-	ret = register_kretprobe(&kp_getdents);
+	/* -- kprobe: filldir64 (directory listing) -- */
+	kp_filldir.symbol_name = "filldir64";
+	kp_filldir.pre_handler = filldir_pre;
+	ret = register_kprobe(&kp_filldir);
 	if (ret) {
-		pr_warn("nohello: register_kretprobe(ksys_getdents64) "
-			"failed: %d; file visible in listings but still "
-			"hidden from direct access\n", ret);
+		pr_warn("nohello: cannot kprobe filldir64 (%d); "
+			"file visible in listings but still hidden from "
+			"direct access\n", ret);
 	} else {
-		pr_info("nohello: hooked ksys_getdents64\n");
+		pr_info("nohello: hooked filldir64\n");
 	}
 
-	pr_info("nohello: loaded — %s is now hidden\n", TARGET_PATH);
+	pr_info("nohello: loaded -- %s is now hidden\n", TARGET_PATH);
 	return 0;
 }
 
@@ -254,9 +199,12 @@ static void __exit nohello_exit(void)
 	unregister_kretprobe(&kp_inode_getattr);
 	synchronize_rcu();
 
-	unregister_kretprobe(&kp_getdents);
+	if (kp_filldir.symbol_name) {
+		unregister_kprobe(&kp_filldir);
+		kp_filldir.symbol_name = NULL;
+	}
 
-	pr_info("nohello: unloaded — %s is visible again\n", TARGET_PATH);
+	pr_info("nohello: unloaded -- %s is visible again\n", TARGET_PATH);
 }
 
 module_init(nohello_init);

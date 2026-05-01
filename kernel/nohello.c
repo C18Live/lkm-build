@@ -33,7 +33,7 @@ struct inode_perm_data {
 
 static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct inode_perm_data *d = ri->data;
+	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
 	struct inode *inode;
 
 	d->matched = 0;
@@ -56,7 +56,7 @@ static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int perm_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct inode_perm_data *d = ri->data;
+	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
 
 	if (d->matched)
 		regs_set_return_value(regs, -ENOENT);
@@ -69,7 +69,7 @@ static struct kretprobe kp_inode_getattr;
 
 static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct inode_perm_data *d = ri->data;
+	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
 	struct path *path;
 	struct inode *inode;
 
@@ -91,7 +91,7 @@ static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct inode_perm_data *d = ri->data;
+	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
 
 	if (d->matched)
 		regs_set_return_value(regs, -ENOENT);
